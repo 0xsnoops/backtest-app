@@ -161,125 +161,142 @@ async def ws_handler(websocket: WebSocket):
 
             action = msg.get("action")
 
-            if action == "start":
-                sim_id = msg.get("sim_id")
-                round_id = msg.get("round_id")
+            try:
+                if action == "start":
+                    sim_id = msg.get("sim_id")
+                    round_id = msg.get("round_id")
+                    print(f"[WS] start action: sim_id={sim_id}, round_id={round_id}")
 
-                # Check if engine already exists
-                if round_id in _engines:
-                    # Verify ownership before granting access
+                    # Check if engine already exists
+                    if round_id in _engines:
+                        # Verify ownership before granting access
+                        async with async_session() as db:
+                            result = await db.execute(
+                                select(Simulation)
+                                .join(Round, Round.simulation_id == Simulation.id)
+                                .where(Round.id == round_id, Simulation.user_id == user_id)
+                            )
+                            if not result.scalar_one_or_none():
+                                await websocket.send_json({"type": "error", "message": "Access denied"})
+                                continue
+                        engine = _engines[round_id]
+                        await send_candle_update()
+                        continue
+
+                    # Load and create engine - with ownership verification
                     async with async_session() as db:
                         result = await db.execute(
-                            select(Simulation)
-                            .join(Round, Round.simulation_id == Simulation.id)
-                            .where(Round.id == round_id, Simulation.user_id == user_id)
+                            select(Simulation).where(
+                                Simulation.id == sim_id,
+                                Simulation.user_id == user_id,
+                            )
                         )
-                        if not result.scalar_one_or_none():
-                            await websocket.send_json({"type": "error", "message": "Access denied"})
+                        sim = result.scalar_one_or_none()
+                        if not sim:
+                            await websocket.send_json({"type": "error", "message": "Simulation not found or access denied"})
                             continue
-                    engine = _engines[round_id]
+
+                        result = await db.execute(
+                            select(Round).where(
+                                Round.id == round_id,
+                                Round.simulation_id == sim_id,
+                            )
+                        )
+                        rnd = result.scalar_one_or_none()
+                        if not rnd:
+                            await websocket.send_json({"type": "error", "message": "Round not found"})
+                            continue
+
+                        provider = get_provider(sim.market)
+                        date = datetime.strptime(rnd.hidden_date, "%Y-%m-%d")
+                        start_ms = int(date.timestamp() * 1000)
+                        end_ms = int((date + timedelta(days=1)).timestamp() * 1000)
+                        print(f"[WS] Fetching candles for {sim.symbol} date={rnd.hidden_date} start_ms={start_ms} end_ms={end_ms}")
+                        candles = await provider.get_candles(sim.symbol, start_ms, end_ms, sim.timeframe)
+                        print(f"[WS] Got {len(candles)} raw candles")
+                        candles = _filter_session(candles, sim.session_filter, sim.session_start, sim.session_end)
+                        print(f"[WS] After session filter: {len(candles)} candles (filter={sim.session_filter})")
+
+                        if not candles:
+                            await websocket.send_json({"type": "error", "message": "No candles for this date"})
+                            continue
+
+                        engine = SimulationEngine(
+                            candles=candles,
+                            starting_capital=sim.starting_capital,
+                            fee_bps=sim.fee_bps,
+                            slippage_bps=sim.slippage_bps,
+                        )
+                        _engines[round_id] = engine
+
+                        rnd.status = RoundStatus.ACTIVE.value
+                        rnd.total_candles = len(candles)
+                        rnd.started_at = datetime.utcnow()
+                        await db.commit()
+
                     await send_candle_update()
-                    continue
+                    print(f"[WS] First candle sent successfully")
 
-                # Load and create engine - with ownership verification
-                async with async_session() as db:
-                    result = await db.execute(
-                        select(Simulation).where(
-                            Simulation.id == sim_id,
-                            Simulation.user_id == user_id,
-                        )
-                    )
-                    sim = result.scalar_one_or_none()
-                    if not sim:
-                        await websocket.send_json({"type": "error", "message": "Simulation not found or access denied"})
+                elif action == "play":
+                    playing = True
+
+                elif action == "pause":
+                    playing = False
+
+                elif action == "step":
+                    playing = False
+                    await advance_and_send()
+
+                elif action == "speed":
+                    speed = float(msg.get("value", 1.0))
+                    speed = max(0.25, min(speed, 10.0))
+
+                elif action == "order":
+                    if not engine or engine.is_finished:
+                        await websocket.send_json({"type": "error", "message": "Cannot place order"})
                         continue
-
-                    result = await db.execute(
-                        select(Round).where(
-                            Round.id == round_id,
-                            Round.simulation_id == sim_id,
-                        )
-                    )
-                    rnd = result.scalar_one_or_none()
-                    if not rnd:
-                        await websocket.send_json({"type": "error", "message": "Round not found"})
-                        continue
-
-                    provider = get_provider(sim.market)
-                    date = datetime.strptime(rnd.hidden_date, "%Y-%m-%d")
-                    start_ms = int(date.timestamp() * 1000)
-                    end_ms = int((date + timedelta(days=1)).timestamp() * 1000)
-                    candles = await provider.get_candles(sim.symbol, start_ms, end_ms, sim.timeframe)
-                    candles = _filter_session(candles, sim.session_filter, sim.session_start, sim.session_end)
-
-                    if not candles:
-                        await websocket.send_json({"type": "error", "message": "No candles for this date"})
-                        continue
-
-                    engine = SimulationEngine(
-                        candles=candles,
-                        starting_capital=sim.starting_capital,
-                        fee_bps=sim.fee_bps,
-                        slippage_bps=sim.slippage_bps,
-                    )
-                    _engines[round_id] = engine
-
-                    rnd.status = RoundStatus.ACTIVE.value
-                    rnd.total_candles = len(candles)
-                    rnd.started_at = datetime.utcnow()
-                    await db.commit()
-
-                await send_candle_update()
-
-            elif action == "play":
-                playing = True
-
-            elif action == "pause":
-                playing = False
-
-            elif action == "step":
-                playing = False
-                await advance_and_send()
-
-            elif action == "speed":
-                speed = float(msg.get("value", 1.0))
-                speed = max(0.25, min(speed, 10.0))
-
-            elif action == "order":
-                if not engine or engine.is_finished:
-                    await websocket.send_json({"type": "error", "message": "Cannot place order"})
-                    continue
-                order_id = str(uuid.uuid4())
-                sim_order = SimOrder(
-                    id=order_id,
-                    side=msg["side"],
-                    type=msg.get("type", "market"),
-                    qty=float(msg["qty"]),
-                    limit_price=float(msg["limit_price"]) if msg.get("limit_price") else None,
-                    ts_index=engine.current_index,
-                )
-                engine.submit_order(sim_order)
-
-                # Save to DB
-                async with async_session() as db:
-                    db.add(Order(
+                    order_id = str(uuid.uuid4())
+                    sim_order = SimOrder(
                         id=order_id,
-                        round_id=round_id,
-                        ts_index=engine.current_index,
                         side=msg["side"],
                         type=msg.get("type", "market"),
                         qty=float(msg["qty"]),
                         limit_price=float(msg["limit_price"]) if msg.get("limit_price") else None,
-                        status=OrderStatus.PENDING.value,
-                    ))
-                    await db.commit()
+                        ts_index=engine.current_index,
+                    )
+                    engine.submit_order(sim_order)
 
-                await websocket.send_json({
-                    "type": "order_ack",
-                    "order_id": order_id,
-                    "side": msg["side"],
-                    "qty": float(msg["qty"]),
-                })
+                    # Save to DB
+                    async with async_session() as db:
+                        db.add(Order(
+                            id=order_id,
+                            round_id=round_id,
+                            ts_index=engine.current_index,
+                            side=msg["side"],
+                            type=msg.get("type", "market"),
+                            qty=float(msg["qty"]),
+                            limit_price=float(msg["limit_price"]) if msg.get("limit_price") else None,
+                            status=OrderStatus.PENDING.value,
+                        ))
+                        await db.commit()
+
+                    await websocket.send_json({
+                        "type": "order_ack",
+                        "order_id": order_id,
+                        "side": msg["side"],
+                        "qty": float(msg["qty"]),
+                    })
+
+            except WebSocketDisconnect:
+                raise
+            except Exception as action_err:
+                print(f"[WS] Error in action '{action}': {action_err}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    await websocket.send_json({"type": "error", "message": str(action_err)})
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         pass
