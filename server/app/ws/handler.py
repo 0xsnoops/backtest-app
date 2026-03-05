@@ -132,7 +132,7 @@ async def ws_handler(websocket: WebSocket):
                 result = await db.execute(select(Round).where(Round.id == round_id))
                 rnd = result.scalar_one_or_none()
                 if rnd:
-                    rnd.status = RoundStatus.FINISHED
+                    rnd.status = RoundStatus.FINISHED.value
                     rnd.finished_at = datetime.utcnow()
                     rnd.current_index = engine.current_index
                     await db.commit()
@@ -224,7 +224,7 @@ async def ws_handler(websocket: WebSocket):
                     )
                     _engines[round_id] = engine
 
-                    rnd.status = RoundStatus.ACTIVE
+                    rnd.status = RoundStatus.ACTIVE.value
                     rnd.total_candles = len(candles)
                     rnd.started_at = datetime.utcnow()
                     await db.commit()
@@ -266,11 +266,11 @@ async def ws_handler(websocket: WebSocket):
                         id=order_id,
                         round_id=round_id,
                         ts_index=engine.current_index,
-                        side=OrderSide(msg["side"]),
-                        type=OrderType(msg.get("type", "market")),
+                        side=msg["side"],
+                        type=msg.get("type", "market"),
                         qty=float(msg["qty"]),
                         limit_price=float(msg["limit_price"]) if msg.get("limit_price") else None,
-                        status=OrderStatus.PENDING,
+                        status=OrderStatus.PENDING.value,
                     ))
                     await db.commit()
 
