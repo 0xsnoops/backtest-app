@@ -174,7 +174,7 @@ async def _persist_fills_and_update_orders(
         result = await db.execute(select(Order).where(Order.id == f.order_id))
         order = result.scalar_one_or_none()
         if order:
-            order.status = OrderStatus.FILLED
+            order.status = OrderStatus.FILLED.value
 
 
 @router.post("", response_model=SimulationResponse)
@@ -214,7 +214,7 @@ async def create_simulation(
             simulation_id=sim.id,
             round_number=i + 1,
             hidden_date=date_str,
-            status=RoundStatus.PENDING,
+            status=RoundStatus.PENDING.value,
         )
         db.add(rnd)
 
@@ -267,7 +267,7 @@ async def start_round(
 ):
     sim, rnd = await _verify_round_ownership(sim_id, round_id, user, db)
 
-    if rnd.status == RoundStatus.ACTIVE:
+    if rnd.status == RoundStatus.ACTIVE.value:
         return rnd
 
     # Fetch candles for this round's hidden date
@@ -291,7 +291,7 @@ async def start_round(
 
     _engines[str(rnd.id)] = engine
 
-    rnd.status = RoundStatus.ACTIVE
+    rnd.status = RoundStatus.ACTIVE.value
     rnd.total_candles = len(candles)
     rnd.current_index = 0
     rnd.started_at = datetime.utcnow()
@@ -330,7 +330,7 @@ async def replay_round(
     _engines[str(rnd.id)] = engine
 
     # Reset round state
-    rnd.status = RoundStatus.ACTIVE
+    rnd.status = RoundStatus.ACTIVE.value
     rnd.current_index = 0
     rnd.total_candles = len(candles)
     rnd.started_at = datetime.utcnow()
@@ -396,7 +396,7 @@ async def advance_round(
     if rnd:
         rnd.current_index = engine.current_index
         if engine.is_finished:
-            rnd.status = RoundStatus.FINISHED
+            rnd.status = RoundStatus.FINISHED.value
             rnd.finished_at = datetime.utcnow()
 
         # Save snapshot
@@ -488,11 +488,11 @@ async def place_order(
         id=order_id,
         round_id=round_id,
         ts_index=engine.current_index,
-        side=OrderSide(data.side),
-        type=OrderType(data.type),
+        side=data.side,
+        type=data.type,
         qty=data.qty,
         limit_price=data.limit_price,
-        status=OrderStatus.PENDING,
+        status=OrderStatus.PENDING.value,
     )
     db.add(db_order)
     await db.commit()
@@ -585,7 +585,7 @@ async def simulation_metrics(
 
     all_metrics = []
     for rnd in rounds:
-        if rnd.status != RoundStatus.FINISHED:
+        if rnd.status != RoundStatus.FINISHED.value:
             continue
 
         # Try in-memory engine first
