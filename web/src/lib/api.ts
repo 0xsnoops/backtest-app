@@ -81,6 +81,9 @@ export const api = {
 
   getSimMetrics: (simId: string) =>
     apiFetch(`/api/simulations/${simId}/metrics`),
+
+  replayRound: (simId: string, roundId: string) =>
+    apiFetch(`/api/simulations/${simId}/rounds/${roundId}/replay`, { method: "POST" }),
 };
 
 export function createWS(token: string): WebSocket {

@@ -106,6 +106,7 @@ class Fill(Base):
     fill_price = Column(Float, nullable=False)
     qty = Column(Float, nullable=False)
     fee = Column(Float, nullable=False, default=0.0)
+    side = Column(String(10), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     order = relationship("Order", back_populates="fills")
     round = relationship("Round", back_populates="fills")

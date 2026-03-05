@@ -1,4 +1,5 @@
 import random
+import math
 from datetime import datetime, timedelta
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,7 +18,9 @@ from app.schemas.schemas import (
     OrderCreate, OrderResponse, FillResponse, SnapshotResponse,
 )
 from app.providers.binance import get_provider
-from app.engine.simulator import SimulationEngine, SimOrder, Candle as EngineCandle
+from app.engine.simulator import SimulationEngine, SimOrder, SimFill, EquitySnapshot
+from app.engine.session_filter import filter_session as _filter_session
+from app.providers.base import Candle as EngineCandle
 
 router = APIRouter(prefix="/api/simulations", tags=["simulations"])
 
@@ -27,6 +30,151 @@ _engines: dict[str, SimulationEngine] = {}
 
 def _get_engine(round_id: str) -> SimulationEngine | None:
     return _engines.get(round_id)
+
+
+async def _verify_sim_ownership(sim_id: UUID, user: User, db: AsyncSession) -> "Simulation":
+    """Verify user owns the simulation. Returns sim or raises 404."""
+    result = await db.execute(
+        select(Simulation).where(Simulation.id == sim_id, Simulation.user_id == user.id)
+    )
+    sim = result.scalar_one_or_none()
+    if not sim:
+        raise HTTPException(404, "Simulation not found")
+    return sim
+
+
+async def _verify_round_ownership(sim_id: UUID, round_id: UUID, user: User, db: AsyncSession) -> tuple:
+    """Verify user owns the simulation AND round belongs to it. Returns (sim, round)."""
+    sim = await _verify_sim_ownership(sim_id, user, db)
+    result = await db.execute(
+        select(Round).where(Round.id == round_id, Round.simulation_id == sim_id)
+    )
+    rnd = result.scalar_one_or_none()
+    if not rnd:
+        raise HTTPException(404, "Round not found")
+    return sim, rnd
+
+
+def _compute_metrics_from_db(
+    snapshots: list[Snapshot],
+    fills: list[Fill],
+    starting_capital: float,
+) -> dict:
+    """Compute round metrics from persisted DB data (no in-memory engine needed)."""
+    if not snapshots:
+        return {
+            "pnl_dollar": 0, "pnl_pct": 0, "max_drawdown": 0, "win_rate": 0,
+            "avg_win": 0, "avg_loss": 0, "num_trades": 0, "profit_factor": 0,
+            "sharpe": 0, "equity_curve": [],
+        }
+
+    equity_curve = [s.equity for s in snapshots]
+    final_equity = equity_curve[-1] if equity_curve else starting_capital
+    pnl_dollar = final_equity - starting_capital
+    pnl_pct = (pnl_dollar / starting_capital) * 100 if starting_capital > 0 else 0
+
+    # Max drawdown
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for eq in equity_curve:
+        if eq > peak:
+            peak = eq
+        dd = (peak - eq) / peak if peak > 0 else 0
+        max_dd = max(max_dd, dd)
+
+    # Compute trade PnLs from fills
+    trade_pnls = _compute_trade_pnls_from_fills(fills)
+    wins = [p for p in trade_pnls if p > 0]
+    losses = [p for p in trade_pnls if p < 0]
+
+    win_rate = len(wins) / len(trade_pnls) * 100 if trade_pnls else 0
+    avg_win = sum(wins) / len(wins) if wins else 0
+    avg_loss = sum(losses) / len(losses) if losses else 0
+    gross_profit = sum(wins) if wins else 0
+    gross_loss = abs(sum(losses)) if losses else 0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999.99 if gross_profit > 0 else 0)
+
+    # Basic Sharpe
+    returns = []
+    for i in range(1, len(equity_curve)):
+        prev = equity_curve[i - 1]
+        if prev > 0:
+            returns.append((equity_curve[i] - prev) / prev)
+    if returns and len(returns) > 1:
+        mean_r = sum(returns) / len(returns)
+        std_r = (sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5
+        sharpe = (mean_r / std_r) * (252 ** 0.5) if std_r > 0 else 0
+    else:
+        sharpe = 0
+
+    return {
+        "pnl_dollar": round(pnl_dollar, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "max_drawdown": round(max_dd * 100, 2),
+        "win_rate": round(win_rate, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "num_trades": len(trade_pnls),
+        "profit_factor": round(profit_factor, 2),
+        "sharpe": round(sharpe, 2),
+        "equity_curve": [round(e, 2) for e in equity_curve],
+    }
+
+
+def _compute_trade_pnls_from_fills(fills: list[Fill]) -> list[float]:
+    """Compute PnL for each round-trip trade from DB fills."""
+    pnls = []
+    position = 0.0
+    entry_cost = 0.0
+    for fill in fills:
+        side = fill.side if isinstance(fill.side, str) else fill.side.value
+        signed = fill.qty if side == "buy" else -fill.qty
+        if position == 0 or (position > 0 and signed > 0) or (position < 0 and signed < 0):
+            entry_cost += fill.fill_price * abs(signed) + fill.fee
+            position += signed
+        else:
+            close_qty = min(abs(signed), abs(position))
+            avg_entry = entry_cost / abs(position) if abs(position) > 1e-10 else 0
+            if position > 0:
+                pnl = (fill.fill_price - avg_entry) * close_qty - fill.fee
+            else:
+                pnl = (avg_entry - fill.fill_price) * close_qty - fill.fee
+            pnls.append(pnl)
+            remaining = abs(signed) - close_qty
+            if remaining > 1e-10:
+                position = remaining if signed > 0 else -remaining
+                entry_cost = fill.fill_price * remaining
+            else:
+                position += signed
+                if abs(position) < 1e-10:
+                    position = 0
+                    entry_cost = 0
+                else:
+                    entry_cost = entry_cost * (abs(position) / (abs(position) + close_qty))
+    return pnls
+
+
+async def _persist_fills_and_update_orders(
+    db: AsyncSession,
+    new_fills: list[SimFill],
+    round_id,
+) -> None:
+    """Persist fills to DB and update order statuses to FILLED."""
+    for f in new_fills:
+        db.add(Fill(
+            order_id=f.order_id,
+            round_id=round_id,
+            ts_index=f.ts_index,
+            fill_price=f.fill_price,
+            qty=f.qty,
+            fee=f.fee,
+            side=f.side,
+        ))
+        # Update the order status to FILLED
+        result = await db.execute(select(Order).where(Order.id == f.order_id))
+        order = result.scalar_one_or_none()
+        if order:
+            order.status = OrderStatus.FILLED
 
 
 @router.post("", response_model=SimulationResponse)
@@ -58,7 +206,6 @@ async def create_simulation(
     provider = get_provider(data.market)
     available_dates = await provider.get_available_dates(data.symbol, data.timeframe)
 
-    # Filter by session if needed
     rng = random.Random(seed)
     selected_dates = rng.sample(available_dates, min(data.num_rounds, len(available_dates)))
 
@@ -95,13 +242,7 @@ async def get_simulation(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Simulation).where(Simulation.id == sim_id, Simulation.user_id == user.id)
-    )
-    sim = result.scalar_one_or_none()
-    if not sim:
-        raise HTTPException(404, "Simulation not found")
-    return sim
+    return await _verify_sim_ownership(sim_id, user, db)
 
 
 @router.get("/{sim_id}/rounds", response_model=list[RoundResponse])
@@ -110,12 +251,7 @@ async def list_rounds(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Simulation).where(Simulation.id == sim_id, Simulation.user_id == user.id)
-    )
-    sim = result.scalar_one_or_none()
-    if not sim:
-        raise HTTPException(404, "Simulation not found")
+    await _verify_sim_ownership(sim_id, user, db)
     result = await db.execute(
         select(Round).where(Round.simulation_id == sim_id).order_by(Round.round_number)
     )
@@ -129,23 +265,9 @@ async def start_round(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Validate ownership
-    result = await db.execute(
-        select(Simulation).where(Simulation.id == sim_id, Simulation.user_id == user.id)
-    )
-    sim = result.scalar_one_or_none()
-    if not sim:
-        raise HTTPException(404, "Simulation not found")
-
-    result = await db.execute(
-        select(Round).where(Round.id == round_id, Round.simulation_id == sim_id)
-    )
-    rnd = result.scalar_one_or_none()
-    if not rnd:
-        raise HTTPException(404, "Round not found")
+    sim, rnd = await _verify_round_ownership(sim_id, round_id, user, db)
 
     if rnd.status == RoundStatus.ACTIVE:
-        # Already started, return it
         return rnd
 
     # Fetch candles for this round's hidden date
@@ -155,17 +277,13 @@ async def start_round(
     end_ms = int((date + timedelta(days=1)).timestamp() * 1000)
 
     candles = await provider.get_candles(sim.symbol, start_ms, end_ms, sim.timeframe)
-
-    # Apply session filter
     candles = _filter_session(candles, sim.session_filter, sim.session_start, sim.session_end)
 
     if not candles:
         raise HTTPException(400, "No candles available for this date/session")
 
-    # Create engine
-    engine_candles = candles
     engine = SimulationEngine(
-        candles=engine_candles,
+        candles=candles,
         starting_capital=sim.starting_capital,
         fee_bps=sim.fee_bps,
         slippage_bps=sim.slippage_bps,
@@ -182,37 +300,44 @@ async def start_round(
     return rnd
 
 
-def _filter_session(candles, session_filter, session_start, session_end):
-    """Filter candles by session time window."""
-    if not session_filter and not session_start:
-        return candles
-    if session_filter == "regular":
-        # 9:30-16:00 ET (approximate using UTC: 14:30-21:00)
-        start_h, start_m = 14, 30
-        end_h, end_m = 21, 0
-    elif session_filter == "premarket":
-        start_h, start_m = 9, 0
-        end_h, end_m = 14, 30
-    elif session_filter == "afterhours":
-        start_h, start_m = 21, 0
-        end_h, end_m = 25, 0  # wraps
-    elif session_filter == "custom" and session_start and session_end:
-        sp = session_start.split(":")
-        ep = session_end.split(":")
-        start_h, start_m = int(sp[0]), int(sp[1])
-        end_h, end_m = int(ep[0]), int(ep[1])
-    else:
-        return candles
+@router.post("/{sim_id}/rounds/{round_id}/replay", response_model=RoundResponse)
+async def replay_round(
+    sim_id: UUID,
+    round_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replay a finished round from the beginning using the same hidden date/config."""
+    sim, rnd = await _verify_round_ownership(sim_id, round_id, user, db)
 
-    filtered = []
-    for c in candles:
-        dt = datetime.utcfromtimestamp(c.timestamp / 1000)
-        t = dt.hour * 60 + dt.minute
-        s = start_h * 60 + start_m
-        e = end_h * 60 + end_m
-        if s <= t < e:
-            filtered.append(c)
-    return filtered
+    # Fetch candles
+    provider = get_provider(sim.market)
+    date = datetime.strptime(rnd.hidden_date, "%Y-%m-%d")
+    start_ms = int(date.timestamp() * 1000)
+    end_ms = int((date + timedelta(days=1)).timestamp() * 1000)
+    candles = await provider.get_candles(sim.symbol, start_ms, end_ms, sim.timeframe)
+    candles = _filter_session(candles, sim.session_filter, sim.session_start, sim.session_end)
+
+    if not candles:
+        raise HTTPException(400, "No candles available for this date/session")
+
+    engine = SimulationEngine(
+        candles=candles,
+        starting_capital=sim.starting_capital,
+        fee_bps=sim.fee_bps,
+        slippage_bps=sim.slippage_bps,
+    )
+    _engines[str(rnd.id)] = engine
+
+    # Reset round state
+    rnd.status = RoundStatus.ACTIVE
+    rnd.current_index = 0
+    rnd.total_candles = len(candles)
+    rnd.started_at = datetime.utcnow()
+    rnd.finished_at = None
+    await db.commit()
+    await db.refresh(rnd)
+    return rnd
 
 
 @router.get("/{sim_id}/rounds/{round_id}/candle")
@@ -222,6 +347,7 @@ async def get_current_candle(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     engine = _get_engine(str(round_id))
     if not engine:
         raise HTTPException(400, "Round not started")
@@ -250,6 +376,7 @@ async def advance_round(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     engine = _get_engine(str(round_id))
     if not engine:
         raise HTTPException(400, "Round not started")
@@ -285,17 +412,8 @@ async def advance_round(
         )
         db.add(db_snap)
 
-        # Save fills
-        for f in new_fills:
-            db_fill = Fill(
-                order_id=f.order_id,
-                round_id=rnd.id,
-                ts_index=f.ts_index,
-                fill_price=f.fill_price,
-                qty=f.qty,
-                fee=f.fee,
-            )
-            db.add(db_fill)
+        # Persist fills and update order statuses
+        await _persist_fills_and_update_orders(db, new_fills, rnd.id)
 
         await db.commit()
 
@@ -344,6 +462,7 @@ async def place_order(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     engine = _get_engine(str(round_id))
     if not engine:
         raise HTTPException(400, "Round not started")
@@ -388,6 +507,7 @@ async def list_orders(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     result = await db.execute(
         select(Order).where(Order.round_id == round_id).order_by(Order.created_at)
     )
@@ -401,6 +521,7 @@ async def list_fills(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     result = await db.execute(
         select(Fill).where(Fill.round_id == round_id).order_by(Fill.created_at)
     )
@@ -414,6 +535,7 @@ async def list_snapshots(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _verify_round_ownership(sim_id, round_id, user, db)
     result = await db.execute(
         select(Snapshot).where(Snapshot.round_id == round_id).order_by(Snapshot.ts_index)
     )
@@ -427,10 +549,25 @@ async def round_metrics(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    sim, rnd = await _verify_round_ownership(sim_id, round_id, user, db)
+
+    # Try in-memory engine first
     engine = _get_engine(str(round_id))
-    if not engine:
-        raise HTTPException(400, "Round not started or engine expired")
-    return engine.compute_metrics()
+    if engine and engine.snapshots:
+        return engine.compute_metrics()
+
+    # Fallback: compute from DB
+    snap_result = await db.execute(
+        select(Snapshot).where(Snapshot.round_id == round_id).order_by(Snapshot.ts_index)
+    )
+    snapshots = list(snap_result.scalars().all())
+
+    fill_result = await db.execute(
+        select(Fill).where(Fill.round_id == round_id).order_by(Fill.created_at)
+    )
+    fills = list(fill_result.scalars().all())
+
+    return _compute_metrics_from_db(snapshots, fills, sim.starting_capital)
 
 
 @router.get("/{sim_id}/metrics")
@@ -439,6 +576,8 @@ async def simulation_metrics(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    sim = await _verify_sim_ownership(sim_id, user, db)
+
     result = await db.execute(
         select(Round).where(Round.simulation_id == sim_id).order_by(Round.round_number)
     )
@@ -446,28 +585,42 @@ async def simulation_metrics(
 
     all_metrics = []
     for rnd in rounds:
+        if rnd.status != RoundStatus.FINISHED:
+            continue
+
+        # Try in-memory engine first
         engine = _get_engine(str(rnd.id))
-        if engine:
+        if engine and engine.snapshots:
             m = engine.compute_metrics()
+            m["round_number"] = rnd.round_number
+            all_metrics.append(m)
+            continue
+
+        # Fallback: compute from DB
+        snap_result = await db.execute(
+            select(Snapshot).where(Snapshot.round_id == rnd.id).order_by(Snapshot.ts_index)
+        )
+        snapshots = list(snap_result.scalars().all())
+
+        fill_result = await db.execute(
+            select(Fill).where(Fill.round_id == rnd.id).order_by(Fill.created_at)
+        )
+        fills = list(fill_result.scalars().all())
+
+        if snapshots:
+            m = _compute_metrics_from_db(snapshots, fills, sim.starting_capital)
             m["round_number"] = rnd.round_number
             all_metrics.append(m)
 
     if not all_metrics:
-        return {"rounds": [], "total_pnl_dollar": 0, "total_pnl_pct": 0}
-
-    result = await db.execute(
-        select(Simulation).where(Simulation.id == sim_id)
-    )
-    sim = result.scalar_one()
+        return {"rounds": [], "total_pnl_dollar": 0, "total_pnl_pct": 0, "total_trades": 0}
 
     total_pnl = sum(m["pnl_dollar"] for m in all_metrics)
     total_trades = sum(m["num_trades"] for m in all_metrics)
-    all_wins = [m for m in all_metrics if m["pnl_dollar"] > 0]
-    all_losses = [m for m in all_metrics if m["pnl_dollar"] < 0]
 
     return {
         "total_pnl_dollar": round(total_pnl, 2),
-        "total_pnl_pct": round(total_pnl / sim.starting_capital * 100, 2),
+        "total_pnl_pct": round(total_pnl / sim.starting_capital * 100, 2) if sim.starting_capital > 0 else 0,
         "total_trades": total_trades,
         "rounds": all_metrics,
     }

@@ -89,6 +89,7 @@ class FillResponse(BaseModel):
     fill_price: float
     qty: float
     fee: float
+    side: Optional[str] = None
 
 
 class SnapshotResponse(BaseModel):

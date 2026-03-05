@@ -29,7 +29,8 @@ from app.database import async_session
 from app.models.tables import Simulation, Round, RoundStatus, Order, Fill, Snapshot, OrderSide, OrderType, OrderStatus
 from app.engine.simulator import SimulationEngine, SimOrder
 from app.providers.binance import get_provider
-from app.api.simulations import _engines, _filter_session
+from app.api.simulations import _engines, _persist_fills_and_update_orders
+from app.engine.session_filter import filter_session as _filter_session
 from sqlalchemy import select
 
 
@@ -114,15 +115,8 @@ async def ws_handler(websocket: WebSocket):
                 realized_pnl=snap.realized_pnl,
             )
             db.add(db_snap)
-            for f in new_fills:
-                db.add(Fill(
-                    order_id=f.order_id,
-                    round_id=round_id,
-                    ts_index=f.ts_index,
-                    fill_price=f.fill_price,
-                    qty=f.qty,
-                    fee=f.fee,
-                ))
+            # Persist fills and update order statuses
+            await _persist_fills_and_update_orders(db, new_fills, round_id)
             await db.commit()
 
     async def advance_and_send():
@@ -173,19 +167,39 @@ async def ws_handler(websocket: WebSocket):
 
                 # Check if engine already exists
                 if round_id in _engines:
+                    # Verify ownership before granting access
+                    async with async_session() as db:
+                        result = await db.execute(
+                            select(Simulation)
+                            .join(Round, Round.simulation_id == Simulation.id)
+                            .where(Round.id == round_id, Simulation.user_id == user_id)
+                        )
+                        if not result.scalar_one_or_none():
+                            await websocket.send_json({"type": "error", "message": "Access denied"})
+                            continue
                     engine = _engines[round_id]
                     await send_candle_update()
                     continue
 
-                # Load and create engine
+                # Load and create engine - with ownership verification
                 async with async_session() as db:
-                    result = await db.execute(select(Simulation).where(Simulation.id == sim_id))
+                    result = await db.execute(
+                        select(Simulation).where(
+                            Simulation.id == sim_id,
+                            Simulation.user_id == user_id,
+                        )
+                    )
                     sim = result.scalar_one_or_none()
                     if not sim:
-                        await websocket.send_json({"type": "error", "message": "Simulation not found"})
+                        await websocket.send_json({"type": "error", "message": "Simulation not found or access denied"})
                         continue
 
-                    result = await db.execute(select(Round).where(Round.id == round_id))
+                    result = await db.execute(
+                        select(Round).where(
+                            Round.id == round_id,
+                            Round.simulation_id == sim_id,
+                        )
+                    )
                     rnd = result.scalar_one_or_none()
                     if not rnd:
                         await websocket.send_json({"type": "error", "message": "Round not found"})

@@ -77,6 +77,7 @@ def upgrade() -> None:
         sa.Column("fill_price", sa.Float, nullable=False),
         sa.Column("qty", sa.Float, nullable=False),
         sa.Column("fee", sa.Float, nullable=False, server_default="0"),
+        sa.Column("side", sa.String(10), nullable=True),
         sa.Column("created_at", sa.DateTime, server_default=sa.func.now()),
     )
 
