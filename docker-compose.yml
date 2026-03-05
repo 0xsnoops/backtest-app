@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: backtest
+      POSTGRES_PASSWORD: backtest
+      POSTGRES_DB: backtest
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  server:
+    build: ./server
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://backtest:backtest@db:5432/backtest
+      JWT_SECRET: change-me-in-production
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      - db
+    volumes:
+      - ./server:/app
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  web:
+    build: ./web
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    depends_on:
+      - server
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+
+volumes:
+  pgdata:

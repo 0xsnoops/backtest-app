@@ -1,0 +1,14 @@
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+/web/node_modules/
+/web/.next/
+/server/__pycache__/
+/tmp/
+pgdata/
